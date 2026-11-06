@@ -1,10 +1,20 @@
 
 import os
 import pickle
+from pathlib import Path
+
+import pandas as pd
 import requests
 import streamlit as st
 
-# ---------------- PAGE CONFIG ----------------
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+
+# =========================================================
+# 1. PAGE CONFIGURATION
+# =========================================================
+
 st.set_page_config(
     page_title="CineVerse | Movie Discovery",
     page_icon="🎬",
@@ -12,401 +22,802 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-API_KEY = os.environ.get("TMDB_API_KEY", "")
+
+# =========================================================
+# 2. API CONFIGURATION
+# =========================================================
+
+try:
+    API_KEY = st.secrets["TMDB_API_KEY"]
+except Exception:
+    API_KEY = os.environ.get("TMDB_API_KEY", "")
+
 BASE_URL = "https://api.themoviedb.org/3"
 IMAGE_URL = "https://image.tmdb.org/t/p/"
 
-# ---------------- PREMIUM DESIGN ----------------
+
+# =========================================================
+# 3. CUSTOM CSS
+# =========================================================
+
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
 
 html, body, [class*="css"] {
     font-family: 'Inter', sans-serif;
 }
 
 .stApp {
-    background: #080b14;
-    color: #ffffff;
+    background:
+        radial-gradient(circle at top right, #252044 0%, transparent 35%),
+        linear-gradient(135deg, #09090f, #11111c 60%, #09090f);
+    color: white;
 }
 
-header {visibility: hidden;}
-
-.block-container {
-    padding-top: 2rem;
-    padding-bottom: 3rem;
-    max-width: 1450px;
-}
-
-h1, h2, h3 {
-    color: white !important;
-    font-weight: 800 !important;
+[data-testid="stSidebar"] {
+    background: #10101b;
+    border-right: 1px solid #29293a;
 }
 
 .hero {
-    background: linear-gradient(100deg, #19132c, #351323, #111827);
-    padding: 42px;
+    padding: 48px 35px;
     border-radius: 22px;
-    border: 1px solid #343047;
+    background:
+        linear-gradient(90deg, rgba(8,8,15,0.97), rgba(8,8,15,0.65)),
+        linear-gradient(135deg, #6328a8, #15152a);
+    border: 1px solid #37304e;
     margin-bottom: 30px;
 }
 
 .hero h1 {
-    font-size: 48px !important;
+    font-size: 48px;
+    font-weight: 800;
     margin-bottom: 8px;
+    color: white;
 }
 
 .hero p {
-    color: #c6c4d1;
+    color: #c7c4d6;
     font-size: 17px;
 }
 
-.movie-card {
-    background: #151925;
-    padding: 12px;
-    border-radius: 14px;
-    border: 1px solid #292e3d;
-    min-height: 100px;
+.section-title {
+    font-size: 25px;
+    font-weight: 800;
+    margin-top: 25px;
+    margin-bottom: 18px;
+    color: white;
 }
 
-.movie-card h4 {
+.movie-title {
+    font-weight: 700;
     font-size: 15px;
     color: white;
-    margin-bottom: 7px;
+    margin-top: 8px;
 }
 
-.movie-card p {
-    color: #b5b8c5;
+.movie-info {
+    color: #aaa8bb;
     font-size: 12px;
 }
 
 div.stButton > button {
-    background: linear-gradient(90deg, #e50914, #ff4b45);
+    background: linear-gradient(90deg, #8138ec, #b13cf2);
     color: white;
     border: none;
     border-radius: 9px;
     font-weight: 700;
-    min-height: 43px;
+    min-height: 42px;
 }
 
 div.stButton > button:hover {
-    background: #ff3039;
+    border: 1px solid #d9a7ff;
     color: white;
-    border: none;
+    background: linear-gradient(90deg, #9b4cff, #c64cff);
 }
 
-section[data-testid="stSidebar"] {
-    background: #101522;
+input, textarea {
+    border-radius: 10px !important;
 }
 
-hr {
-    border-color: #303647;
+footer {
+    visibility: hidden;
 }
+
 </style>
 """, unsafe_allow_html=True)
 
 
-# ---------------- LOAD PROJECT FILES ----------------
+# =========================================================
+# 4. DATASET LOCATION
+# =========================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+
+DATA_PATH = BASE_DIR / "movie_list (1).pkl"
+
+if not DATA_PATH.exists():
+    DATA_PATH = BASE_DIR / "movie_list.pkl"
+
+
+# =========================================================
+# 5. LOAD DATASET AND BUILD RECOMMENDATION MODEL
+# =========================================================
+
 @st.cache_resource
 def load_project():
-    with open("/content/movie_list.pkl", "rb") as f:
-        movie_data = pickle.load(f)
 
-    with open("/content/similarity.pkl", "rb") as f:
-        similarity_data = pickle.load(f)
+    if not DATA_PATH.exists():
+        raise FileNotFoundError(
+            "Movie dataset not found. Upload "
+            "'movie_list (1).pkl' to your GitHub repository."
+        )
 
-    return movie_data, similarity_data
+    with open(DATA_PATH, "rb") as file:
+        movie_data = pickle.load(file)
+
+    if not isinstance(movie_data, pd.DataFrame):
+        raise ValueError(
+            "The movie dataset is not a pandas DataFrame."
+        )
+
+    required_columns = ["movie_id", "title_x", "tags"]
+
+    for column in required_columns:
+        if column not in movie_data.columns:
+            raise ValueError(
+                f"Dataset is missing the required column: {column}"
+            )
+
+    movie_data = movie_data.copy().reset_index(drop=True)
+
+    movie_data["tags"] = (
+        movie_data["tags"].fillna("").astype(str)
+    )
+
+    movie_data["title_x"] = (
+        movie_data["title_x"].fillna("").astype(str)
+    )
+
+    vectorizer = CountVectorizer(
+        max_features=5000,
+        stop_words="english"
+    )
+
+    vectors = vectorizer.fit_transform(
+        movie_data["tags"]
+    )
+
+    return movie_data, vectors
 
 
-movies, similarity = load_project()
+# =========================================================
+# 6. RECOMMENDATION FUNCTION
+# =========================================================
+
+def recommend(movie_title, movie_data, vectors, number=10):
+
+    matches = movie_data[
+        movie_data["title_x"].str.lower() == movie_title.lower()
+    ]
+
+    if matches.empty:
+        return pd.DataFrame()
+
+    movie_index = matches.index[0]
+
+    scores = cosine_similarity(
+        vectors[movie_index],
+        vectors
+    ).flatten()
+
+    movie_indices = scores.argsort()[::-1]
+
+    movie_indices = [
+        index
+        for index in movie_indices
+        if index != movie_index
+    ][:number]
+
+    return movie_data.iloc[movie_indices]
 
 
-# ---------------- TMDB API ----------------
-@st.cache_data(ttl=21600)
-def get_movie_details(movie_id):
+# =========================================================
+# 7. TMDB API FUNCTIONS
+# =========================================================
+
+def tmdb_request(endpoint, params=None):
+
+    if not API_KEY:
+        return None
+
+    request_params = params.copy() if params else {}
+    request_params["api_key"] = API_KEY
+
     try:
         response = requests.get(
-            f"{BASE_URL}/movie/{movie_id}",
-            params={"api_key": API_KEY},
+            f"{BASE_URL}/{endpoint}",
+            params=request_params,
             timeout=15
         )
 
         response.raise_for_status()
+
         return response.json()
 
     except requests.RequestException:
-        return {}
+        return None
+
+
+@st.cache_data(ttl=21600)
+def get_movie_details(movie_id):
+
+    return tmdb_request(
+        f"movie/{int(movie_id)}"
+    )
 
 
 @st.cache_data(ttl=21600)
 def get_trending_movies():
-    try:
-        response = requests.get(
-            f"{BASE_URL}/trending/movie/week",
-            params={"api_key": API_KEY},
-            timeout=15
+
+    data = tmdb_request(
+        "trending/movie/week",
+        {"language": "en-US"}
+    )
+
+    if data:
+        return data.get("results", [])
+
+    return []
+
+
+@st.cache_data(ttl=21600)
+def search_tmdb_movies(query):
+
+    data = tmdb_request(
+        "search/movie",
+        {
+            "query": query,
+            "language": "en-US",
+            "include_adult": False
+        }
+    )
+
+    if data:
+        return data.get("results", [])
+
+    return []
+
+
+def poster_url(path, size="w500"):
+
+    if not path:
+        return None
+
+    return f"{IMAGE_URL}{size}{path}"
+
+
+# =========================================================
+# 8. MOVIE CARD
+# =========================================================
+
+def movie_card(movie, show_details=True):
+
+    movie_id = movie.get("id")
+
+    if not movie_id:
+        return
+
+    title = movie.get("title", "Unknown Movie")
+    poster = poster_url(movie.get("poster_path"))
+    rating = movie.get("vote_average") or 0
+    release_date = movie.get("release_date", "")
+
+    with st.container():
+
+        if poster:
+            st.image(poster, width="stretch")
+        else:
+            st.markdown("### 🎬 Poster unavailable")
+
+        st.markdown(
+            f"<div class='movie-title'>{title}</div>",
+            unsafe_allow_html=True
         )
 
-        response.raise_for_status()
-        return response.json().get("results", [])
+        st.markdown(
+            f"<div class='movie-info'>⭐ {rating:.1f}/10</div>",
+            unsafe_allow_html=True
+        )
 
-    except requests.RequestException:
-        return []
+        if release_date:
+            st.caption(f"Release: {release_date}")
 
+        if show_details:
 
-# ---------------- RECOMMENDATION ENGINE ----------------
-def recommend(movie_title):
-    matched = movies[
-        movies["title_x"].str.lower() == movie_title.lower()
-    ]
-
-    if matched.empty:
-        return []
-
-    index = matched.index[0]
-    distances = similarity[index]
-
-    movie_indices = sorted(
-        enumerate(distances),
-        key=lambda x: x[1],
-        reverse=True
-    )[1:11]
-
-    recommendations = []
-
-    for movie_index, score in movie_indices:
-        row = movies.iloc[movie_index]
-
-        recommendations.append({
-            "title": row["title_x"],
-            "movie_id": int(row["movie_id"]),
-            "score": float(score)
-        })
-
-    return recommendations
+            if st.button(
+                "View Details",
+                key=f"details_{movie_id}",
+                use_container_width=True
+            ):
+                st.session_state["selected_movie_id"] = movie_id
 
 
-# ---------------- MOVIE CARD ----------------
-def display_movie_card(movie, show_score=False):
-    movie_id = movie.get("id", movie.get("movie_id"))
-    title = movie.get("title", "Unknown Movie")
+# =========================================================
+# 9. MOVIE DETAILS
+# =========================================================
+
+def show_movie_details(movie_id):
 
     details = get_movie_details(movie_id)
 
-    poster_path = details.get("poster_path")
-    rating = details.get("vote_average", movie.get("vote_average", 0))
-    release_date = details.get("release_date", "")
+    if not details:
+        st.error("Unable to load movie details.")
+        return
 
-    st.markdown('<div class="movie-card">', unsafe_allow_html=True)
+    st.markdown("---")
 
-    if poster_path:
-        st.image(
-            IMAGE_URL + "w500" + poster_path,
-            use_container_width=True
+    col1, col2 = st.columns([1, 2])
+
+    with col1:
+
+        poster = poster_url(
+            details.get("poster_path")
         )
-    else:
-        st.markdown("🎬 Poster unavailable")
 
-    st.markdown(f"**{title}**")
-    st.caption(f"⭐ {rating:.1f}/10")
+        if poster:
+            st.image(poster, width="stretch")
 
-    if release_date:
-        st.caption(release_date[:4])
+    with col2:
 
-    if show_score:
-        st.caption(f"Match: {movie['score']:.1%}")
+        st.title(
+            details.get("title", "Movie")
+        )
 
-    st.markdown(
-        f"[View movie ↗](https://www.themoviedb.org/movie/{movie_id})"
+        st.write(
+            details.get(
+                "overview",
+                "No description available."
+            )
+        )
+
+        rating = details.get("vote_average") or 0
+
+        st.metric(
+            "⭐ TMDB Rating",
+            f"{rating:.1f}/10"
+        )
+
+        st.write(
+            "**Release Date:**",
+            details.get("release_date", "Not available")
+        )
+
+        st.write(
+            "**Runtime:**",
+            f"{details.get('runtime', 'N/A')} minutes"
+        )
+
+        genres = [
+            genre["name"]
+            for genre in details.get("genres", [])
+        ]
+
+        st.write(
+            "**Genres:**",
+            ", ".join(genres) if genres else "Not available"
+        )
+
+        st.write(
+            "**Status:**",
+            details.get("status", "Not available")
+        )
+
+        st.link_button(
+            "Open on TMDB ↗",
+            f"https://www.themoviedb.org/movie/{movie_id}"
+        )
+
+
+# =========================================================
+# 10. LOAD PROJECT
+# =========================================================
+
+try:
+
+    movies, vectors = load_project()
+
+except Exception as error:
+
+    st.error(f"Project loading error: {error}")
+
+    st.info(
+        "Check that movie_list (1).pkl is uploaded "
+        "to the same GitHub folder as this application."
     )
 
-    st.markdown('</div>', unsafe_allow_html=True)
+    st.stop()
 
 
-# ---------------- SIDEBAR ----------------
+# =========================================================
+# 11. SIDEBAR NAVIGATION
+# =========================================================
+
 with st.sidebar:
-    st.markdown("# 🎬 CineVerse")
-    st.caption("Your personal movie universe")
+
+    st.markdown("# 🎬 CINEVERSE")
+
+    st.caption("YOUR PERSONAL MOVIE UNIVERSE")
 
     st.markdown("---")
 
     page = st.radio(
-        "EXPLORE",
-        ["Home", "Discover Movies", "About"]
+        "NAVIGATION",
+        [
+            "🏠 Home",
+            "🔍 Discover Movies",
+            "ℹ️ About"
+        ],
+        key="navigation"
     )
 
     st.markdown("---")
-    st.caption("Powered by your movie recommendation engine")
+
+    st.markdown("### 🎥 Your Movie World")
+
+    st.caption(
+        f"Movies in database: {len(movies):,}"
+    )
+
+    st.markdown("---")
+
+    st.caption("Powered by TMDB")
 
 
-# ---------------- HOME PAGE ----------------
-if page == "Home":
+# =========================================================
+# 12. HOME PAGE
+# =========================================================
+
+if page == "🏠 Home":
 
     st.markdown("""
     <div class="hero">
-        <h1>🎬 CINEVERSE</h1>
-        <p>Discover stories. Explore worlds. Find your next favourite movie.</p>
-        <p>Thousands of movies. Endless possibilities.</p>
+        <h1>Welcome to CineVerse 🍿</h1>
+        <p>
+            Discover movies. Explore new worlds.
+            Find your next favourite film.
+        </p>
     </div>
     """, unsafe_allow_html=True)
 
-    st.subheader("🔥 Trending This Week")
+    if not API_KEY:
+
+        st.warning(
+            "TMDB API key is missing. Add TMDB_API_KEY "
+            "in your Streamlit Cloud Secrets."
+        )
+
+    st.markdown(
+        "<div class='section-title'>🔥 Trending This Week</div>",
+        unsafe_allow_html=True
+    )
 
     trending = get_trending_movies()
 
     if trending:
-        cols = st.columns(5)
 
-        for col, movie in zip(cols, trending[:5]):
-            with col:
-                display_movie_card(movie)
+        columns = st.columns(5)
+
+        for index, movie in enumerate(trending[:10]):
+
+            with columns[index % 5]:
+                movie_card(movie)
+
     else:
-        st.info("Trending movies are temporarily unavailable.")
 
-    st.markdown("---")
+        st.info(
+            "Trending movies are currently unavailable."
+        )
 
-    st.subheader("🍿 Find Movies Similar to Your Favourite")
+    st.markdown(
+        "<div class='section-title'>✨ Find Your Next Favourite</div>",
+        unsafe_allow_html=True
+    )
+
+    movie_options = sorted(
+        movies["title_x"].unique().tolist()
+    )
 
     selected_movie = st.selectbox(
-        "Choose a movie",
-        sorted(movies["title_x"].dropna().unique().tolist())
+        "Choose a movie you already love",
+        movie_options
     )
 
-    if st.button("✨ Discover My Movies", use_container_width=True):
+    if st.button(
+        "🚀 Recommend Movies For Me",
+        use_container_width=True
+    ):
 
-        with st.spinner("Finding movies you'll love..."):
-            results = recommend(selected_movie)
-
-        st.session_state["recommendations"] = results
-        st.session_state["selected_movie"] = selected_movie
-
-    if "recommendations" in st.session_state:
-
-        st.markdown("## 🎯 Recommended For You")
-
-        cols = st.columns(5)
-
-        for col, movie in zip(
-            cols,
-            st.session_state["recommendations"][:5]
+        with st.spinner(
+            "Finding movies you might love..."
         ):
-            with col:
-                display_movie_card(movie, show_score=True)
 
+            recommendations = recommend(
+                selected_movie,
+                movies,
+                vectors,
+                number=10
+            )
 
-# ---------------- DISCOVER PAGE ----------------
-elif page == "Discover Movies":
+            st.session_state["home_recommendations"] = (
+                recommendations
+            )
 
-    st.markdown("# 🔎 Discover Movies")
-    st.caption("Search for a movie from our collection of 4,800 films.")
+            st.session_state["home_selected_movie"] = (
+                selected_movie
+            )
 
-    search_movie = st.selectbox(
-        "Search or select a movie",
-        sorted(movies["title_x"].dropna().unique().tolist()),
-        key="discover_movie"
-    )
+    if "home_recommendations" in st.session_state:
 
-    if st.button("Explore Movie", use_container_width=True):
+        st.success(
+            "Movies similar to "
+            + st.session_state["home_selected_movie"]
+        )
 
-        matched = movies[
-            movies["title_x"] == search_movie
+        recommendations = st.session_state[
+            "home_recommendations"
         ]
 
-        if not matched.empty:
+        columns = st.columns(5)
 
-            movie_id = int(matched.iloc[0]["movie_id"])
+        for index, (_, row) in enumerate(
+            recommendations.iterrows()
+        ):
 
-            with st.spinner("Loading movie information..."):
-                details = get_movie_details(movie_id)
+            details = get_movie_details(
+                row["movie_id"]
+            )
 
-            st.markdown("---")
+            with columns[index % 5]:
 
-            left, right = st.columns([1, 2])
-
-            with left:
-                poster = details.get("poster_path")
-
-                if poster:
-                    st.image(
-                        IMAGE_URL + "w500" + poster,
-                        use_container_width=True
+                if details:
+                    movie_card(
+                        details,
+                        show_details=False
                     )
                 else:
-                    st.info("Poster unavailable")
-
-            with right:
-                st.title(details.get("title", search_movie))
-
-                st.write(
-                    f"⭐ {details.get('vote_average', 0):.1f}/10"
-                )
-
-                st.write(
-                    f"📅 Release date: {details.get('release_date', 'Unknown')}"
-                )
-
-                st.write(
-                    f"⏱️ Runtime: {details.get('runtime', 'Unknown')} minutes"
-                )
-
-                genres = details.get("genres", [])
-
-                if genres:
-                    st.write(
-                        "🎭 Genres: " +
-                        ", ".join(g["name"] for g in genres)
+                    st.markdown(
+                        f"**{row['title_x']}**"
                     )
 
-                st.write(
-                    details.get("overview", "No description available.")
-                )
 
-                st.link_button(
-                    "View on TMDB",
-                    f"https://www.themoviedb.org/movie/{movie_id}"
-                )
+# =========================================================
+# 13. DISCOVER MOVIES PAGE
+# =========================================================
 
-            st.markdown("---")
+elif page == "🔍 Discover Movies":
 
-            st.subheader("🎯 Similar Movies")
+    st.markdown(
+        "<div class='section-title'>🔍 Discover Movies</div>",
+        unsafe_allow_html=True
+    )
 
-            results = recommend(search_movie)
-            cols = st.columns(5)
+    query = st.text_input(
+        "Search for your favourite movie",
+        placeholder="Example: Interstellar, Avatar, Inception..."
+    )
 
-            for col, movie in zip(cols, results[:5]):
-                with col:
-                    display_movie_card(movie, show_score=True)
+    if query:
 
+        with st.spinner("Searching movies..."):
 
-# ---------------- ABOUT PAGE ----------------
-elif page == "About":
+            results = search_tmdb_movies(query)
 
-    st.markdown("# About CineVerse")
+        if results:
 
-    st.write("""
-    CineVerse is a content-based movie recommendation system.
+            columns = st.columns(5)
 
-    It uses movie information and cosine similarity to identify
-    films with similar characteristics.
+            for index, movie in enumerate(results[:15]):
 
-    **Project features**
+                with columns[index % 5]:
+                    movie_card(movie)
 
-    - Content-based movie recommendations
-    - 4,800 movie records
-    - TMDB movie posters
-    - Real-time movie information
-    - Ratings and descriptions
-    - Trending movie discovery
-    - Netflix-inspired dark interface
-    """)
+        else:
+
+            st.info(
+                "No movies found. Try another search."
+            )
 
     st.markdown("---")
-    st.write("Built with Python, Streamlit, Scikit-learn and TMDB.")
 
-# ---------------- FOOTER ----------------
+    st.markdown(
+        "<div class='section-title'>🎞️ Explore Our Collection</div>",
+        unsafe_allow_html=True
+    )
+
+    collection_search = st.text_input(
+        "Search in our recommendation dataset",
+        placeholder="Enter a movie title..."
+    )
+
+    if collection_search:
+
+        filtered = movies[
+            movies["title_x"].str.contains(
+                collection_search,
+                case=False,
+                na=False
+            )
+        ]
+
+        if filtered.empty:
+
+            st.warning(
+                "Movie not found in our collection."
+            )
+
+        else:
+
+            for _, row in filtered.head(10).iterrows():
+
+                col1, col2 = st.columns([3, 1])
+
+                with col1:
+
+                    st.write(
+                        f"🎬 **{row['title_x']}**"
+                    )
+
+                with col2:
+
+                    if st.button(
+                        "Recommend",
+                        key=f"discover_{row['movie_id']}"
+                    ):
+
+                        recommendations = recommend(
+                            row["title_x"],
+                            movies,
+                            vectors,
+                            number=10
+                        )
+
+                        st.session_state[
+                            "discover_recommendations"
+                        ] = recommendations
+
+                        st.session_state[
+                            "discover_title"
+                        ] = row["title_x"]
+
+    if "discover_recommendations" in st.session_state:
+
+        st.markdown("---")
+
+        st.subheader(
+            "Recommendations for "
+            + st.session_state["discover_title"]
+        )
+
+        recommendations = st.session_state[
+            "discover_recommendations"
+        ]
+
+        columns = st.columns(5)
+
+        for index, (_, row) in enumerate(
+            recommendations.iterrows()
+        ):
+
+            details = get_movie_details(
+                row["movie_id"]
+            )
+
+            with columns[index % 5]:
+
+                if details:
+
+                    movie_card(
+                        details,
+                        show_details=False
+                    )
+
+                else:
+
+                    st.write(
+                        row["title_x"]
+                    )
+
+
+# =========================================================
+# 14. SELECTED MOVIE DETAILS
+# =========================================================
+
+if (
+    page != "ℹ️ About"
+    and "selected_movie_id" in st.session_state
+):
+
+    show_movie_details(
+        st.session_state["selected_movie_id"]
+    )
+
+
+# =========================================================
+# 15. ABOUT PAGE
+# =========================================================
+
+if page == "ℹ️ About":
+
+    st.markdown("""
+    <div class="hero">
+        <h1>About CineVerse 🎬</h1>
+        <p>
+            Your personal movie discovery and
+            recommendation platform.
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.subheader("What is CineVerse?")
+
+    st.write("""
+    CineVerse is a movie recommendation system built using
+    Python, Machine Learning, Streamlit and The Movie Database
+    (TMDB) API.
+
+    It helps users discover movies based on their interests
+    and find similar movies using content-based filtering.
+    """)
+
+    st.subheader("✨ Features")
+
+    st.markdown("""
+    - 🎬 Movie recommendations
+    - 🔥 Trending movies
+    - 🔍 Movie search
+    - 🖼️ Movie posters
+    - ⭐ Ratings and movie information
+    - 🤖 Content-based filtering
+    - 🌙 Premium dark interface
+    """)
+
+    st.subheader("🛠️ Technologies Used")
+
+    st.markdown("""
+    - Python
+    - Streamlit
+    - Pandas
+    - Scikit-learn
+    - TMDB API
+    - CountVectorizer
+    - Cosine Similarity
+    """)
+
+
+# =========================================================
+# 16. FOOTER
+# =========================================================
+
 st.markdown("---")
 
-st.caption(
-    "Movie data and images provided by TMDB. "
-    "This product uses the TMDB API but is not endorsed or certified by TMDB."
-)
+st.markdown("""
+<div style="text-align:center; color:#aaa; padding:15px;">
+
+    <h3>🎬 CINEVERSE</h3>
+
+    <p>Discover. Explore. Experience Movies.</p>
+
+    <p style="font-size:12px;">
+        This product uses the TMDB API but is not endorsed
+        or certified by TMDB.
+    </p>
+
+    <p style="font-size:12px;">
+        Made with ❤️ using Python and Streamlit
+    </p>
+
+</div>
+""", unsafe_allow_html=True)
